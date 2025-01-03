@@ -819,6 +819,7 @@ def _convert_pdf_to_pdfa(pdf_data: bytes) -> bytes:
 	with subprocess.Popen(
 		[
 			"gs",
+			"-q",
 			"-dPDFA=3",
 			"-dBATCH",
 			"-dNOPAUSE",
