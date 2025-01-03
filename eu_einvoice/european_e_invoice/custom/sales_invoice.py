@@ -841,6 +841,13 @@ def _convert_pdf_to_pdfa(pdf_data: bytes) -> bytes:
 		return pdfa_data
 
 
+def _is_ghostscript_installed():
+	"""Check if Ghostscript is installed on the system."""
+	import shutil
+
+	return shutil.which("gs") is not None
+
+
 def attach_xml_to_pdf(invoice_id: str, pdf_data: bytes) -> bytes:
 	"""Return the PDF data with the invoice attached as XML.
 
@@ -850,7 +857,8 @@ def attach_xml_to_pdf(invoice_id: str, pdf_data: bytes) -> bytes:
 	"""
 	from drafthorse.pdf import attach_xml
 
-	pdf_data = _convert_pdf_to_pdfa(pdf_data)
+	if _is_ghostscript_installed():
+		pdf_data = _convert_pdf_to_pdfa(pdf_data)
 
 	level = frappe.db.get_value("Sales Invoice", invoice_id, "einvoice_profile")
 	if level == "XRECHNUNG":
