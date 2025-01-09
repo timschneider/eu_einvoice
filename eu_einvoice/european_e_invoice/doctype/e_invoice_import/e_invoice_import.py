@@ -93,6 +93,8 @@ class EInvoiceImport(Document):
 			self.guess_uom()
 			self.guess_item_code()
 
+		self.guess_po_details()
+
 	def before_submit(self):
 		if not self.supplier:
 			frappe.throw(_("Please create or select a supplier before submitting"))
@@ -112,7 +114,12 @@ class EInvoiceImport(Document):
 
 		invoices = frappe.get_list(
 			"Purchase Invoice",
-			filters={"bill_no": self.id, "supplier": self.supplier, "company": self.company},
+			filters={
+				"bill_no": self.id,
+				"supplier": self.supplier,
+				"company": self.company,
+				"docstatus": ("!=", 2),
+			},
 			fields=["name", "e_invoice_import"],
 		)
 		linked_invoice = next(
@@ -142,7 +149,7 @@ class EInvoiceImport(Document):
 		self.parse_seller(doc.trade.agreement.seller)
 		self.parse_buyer(doc.trade.agreement.buyer)
 
-		buyer_reference = str(doc.trade.agreement.buyer_order.issuer_assigned_id)
+		buyer_reference = doc.trade.agreement.buyer_order.issuer_assigned_id._text
 		if (
 			not self.purchase_order
 			and buyer_reference
@@ -311,6 +318,35 @@ class EInvoiceImport(Document):
 					"parent",
 				)
 
+	def guess_po_details(self):
+		if not self.purchase_order:
+			for pi_row in self.items:
+				pi_row.po_detail = None
+			return
+
+		purchase_order = frappe.get_doc("Purchase Order", self.purchase_order)
+		po_items = [
+			frappe._dict(
+				name=po_row.name,
+				item_code=po_row.item_code,
+				unbilled_amount=po_row.amount - po_row.billed_amt,
+			)
+			for po_row in purchase_order.items
+		]
+		for pi_row in self.items:
+			if pi_row.po_detail and frappe.db.exists(
+				"Purchase Order Item", {"name": pi_row.po_detail, "parent": self.purchase_order}
+			):
+				continue
+
+			for po_row in po_items:
+				if po_row.item_code == pi_row.item and po_row.unbilled_amount >= pi_row.total_amount:
+					pi_row.po_detail = po_row.name
+					po_row.unbilled_amount -= pi_row.total_amount
+					break
+			else:
+				pi_row.po_detail = None
+
 	def add_seller_product_ids_to_items(self):
 		for row in self.items:
 			try:
@@ -331,11 +367,11 @@ def flt_or_none(value) -> float | None:
 
 def get_xml_bytes(file: Path) -> bytes:
 	"""Reads the XML data from the given XML or PDF file path."""
-	if file.suffix == ".pdf":
+	if file.suffix.lower() == ".pdf":
 		xml_filename, xml_bytes = get_xml_from_pdf(file.read_bytes(), check_xsd=False)
 		if not xml_bytes:
 			frappe.throw(_("No XML data found in PDF file."))
-	elif file.suffix == ".xml":
+	elif file.suffix.lower() == ".xml":
 		xml_bytes = file.read_bytes()
 	else:
 		frappe.throw(_("Unsupported file format '{0}'").format(file.suffix))
@@ -347,6 +383,10 @@ def get_xml_bytes(file: Path) -> bytes:
 def create_purchase_invoice(source_name, target_doc=None):
 	def post_process(source, target: "PurchaseInvoice"):
 		target.set_missing_values()
+
+	def process_item_row(source, target, source_parent) -> None:
+		if source_parent.purchase_order:
+			target.purchase_order = source_parent.purchase_order
 
 	def process_tax_row(source, target, source_parent) -> None:
 		target.charge_type = "Actual"
@@ -382,7 +422,9 @@ def create_purchase_invoice(source_name, target_doc=None):
 					"billed_quantity": "qty",
 					"uom": "uom",
 					"net_rate": "rate",
+					"po_detail": "po_detail",
 				},
+				"postprocess": process_item_row,
 			},
 			"E Invoice Trade Tax": {
 				"doctype": "Purchase Taxes and Charges",
@@ -520,3 +562,48 @@ def link_to_purchase_invoice(einvoice: str, purchase_invoice: str):
 		frappe.throw(_("E Invoice Import {0} does not exist").format(einvoice))
 
 	pi.db_set("e_invoice_import", einvoice)
+
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def po_item_query(doctype, txt, searchfield, start, page_len, filters, as_dict=False):
+	item_code = filters.pop("item_code")
+	purchase_order = filters.pop("parent")
+
+	if not purchase_order:
+		return []
+
+	purchase_order = frappe.get_cached_doc("Purchase Order", purchase_order)
+	purchase_order.check_permission("read")
+
+	results = [
+		[
+			row.name,
+			_("Row {0}").format(row.idx),
+			row.item_code,
+			row.description[:100] + "..." if len(row.description) > 40 else row.description,
+			row.get_formatted("qty") + " " + row.uom,
+			row.get_formatted("net_rate") + " / " + row.uom,
+		]
+		for row in purchase_order.items
+		if not item_code or row.item_code == item_code
+	]
+
+	if not txt:
+		return results
+
+	return [row for row in results if txt in ", ".join(row)]
+
+
+@frappe.whitelist()
+def get_po_item_details(po_detail: str):
+	purchase_order_name = frappe.db.get_value("Purchase Order Item", po_detail, "parent")
+	purchase_order = frappe.get_cached_doc("Purchase Order", purchase_order_name)
+	if not purchase_order.has_permission("read"):
+		return {}
+
+	row = purchase_order.getone("items", {"name": po_detail})
+	return {
+		"item_code": row.item_code,
+		"uom": row.uom,
+	}
